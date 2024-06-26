@@ -3,7 +3,8 @@ spring:
     nacos:
       username: nacos
       password: nacos
-      server-addr: 192.168.0.103:8848
+      server-addr: 192.168.10.11:8848
+#      server-addr: 192.168.0.103:8848
       config:
         namespace: 75a593f5-33e6-4c65-b2a0-18c403d20f63
         file-extension: yaml
