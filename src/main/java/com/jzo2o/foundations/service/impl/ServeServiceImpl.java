@@ -1,22 +1,29 @@
 package com.jzo2o.foundations.service.impl;
 
-import com.jzo2o.common.expcetions.CommonException;
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.util.ObjectUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.jzo2o.common.expcetions.ForbiddenOperationException;
 import com.jzo2o.common.model.PageResult;
-import com.jzo2o.common.utils.BeanUtils;
-import com.jzo2o.common.utils.ObjectUtils;
+import com.jzo2o.foundations.constants.RedisConstants;
 import com.jzo2o.foundations.enums.FoundationStatusEnum;
 import com.jzo2o.foundations.mapper.RegionMapper;
 import com.jzo2o.foundations.mapper.ServeItemMapper;
 import com.jzo2o.foundations.mapper.ServeMapper;
+import com.jzo2o.foundations.model.domain.Region;
 import com.jzo2o.foundations.model.domain.Serve;
 import com.jzo2o.foundations.model.domain.ServeItem;
+import com.jzo2o.foundations.model.domain.ServeSync;
 import com.jzo2o.foundations.model.dto.request.ServePageQueryReqDTO;
 import com.jzo2o.foundations.model.dto.request.ServeUpsertReqDTO;
 import com.jzo2o.foundations.model.dto.response.ServeResDTO;
 import com.jzo2o.foundations.service.IServeService;
-import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.jzo2o.mysql.utils.PageHelperUtils;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -26,48 +33,57 @@ import java.util.List;
 
 /**
  * <p>
- * 服务表 服务实现类
+ * 服务实现类
  * </p>
  *
- * @author peng
- * @since 2024-06-18
+ * @author itcast
+ * @since 2023-07-03
  */
 @Service
 public class ServeServiceImpl extends ServiceImpl<ServeMapper, Serve> implements IServeService {
 
     @Resource
     private ServeItemMapper serveItemMapper;
+
     @Resource
     private RegionMapper regionMapper;
 
+    /**
+     * 分页查询
+     *
+     * @param servePageQueryReqDTO 查询条件
+     * @return 分页结果
+     */
     @Override
     public PageResult<ServeResDTO> page(ServePageQueryReqDTO servePageQueryReqDTO) {
         //调用mapper查询数据，这里由于继承了ServiceImpl<ServeMapper, Serve>，使用baseMapper相当于使用ServeMapper
-        return PageHelperUtils.selectPage(servePageQueryReqDTO, () -> baseMapper.queryServeListByRegionId(servePageQueryReqDTO.getRegionId()));
+        PageResult<ServeResDTO> serveResDTOPageResult = PageHelperUtils.selectPage(servePageQueryReqDTO, () -> baseMapper.queryServeListByRegionId(servePageQueryReqDTO.getRegionId()));
+        return serveResDTOPageResult;
     }
 
     @Override
+    @Transactional
     public void batchAdd(List<ServeUpsertReqDTO> serveUpsertReqDTOList) {
         for (ServeUpsertReqDTO serveUpsertReqDTO : serveUpsertReqDTOList) {
-            //合法性校验，是否存在并且启用服务项
+            //1.校验服务项是否为启用状态，不是启用状态不能新增
             ServeItem serveItem = serveItemMapper.selectById(serveUpsertReqDTO.getServeItemId());
-            if(ObjectUtils.isNull(serveItem) || serveItem.getActiveStatus() != FoundationStatusEnum.ENABLE.getStatus()){
-                throw new ForbiddenOperationException("服务项不存在或服务项为启动不允许添加");
+            if(!(serveItem.getActiveStatus() == FoundationStatusEnum.ENABLE.getStatus())){
+                throw new ForbiddenOperationException("该服务未启用无法添加到区域下使用");
             }
-            //同一区域下不能有相同服务
-            Integer count = lambdaQuery()
-                    .eq(Serve::getServeItemId, serveUpsertReqDTO.getServeItemId())
+
+            //2.校验是否重复新增
+            LambdaQueryWrapper<Serve> queryWrapper = Wrappers.<Serve>lambdaQuery()
                     .eq(Serve::getRegionId, serveUpsertReqDTO.getRegionId())
-                    .count();
-            if(count > 0){
-                throw new ForbiddenOperationException(serveItem.getName() + "服务已存在");
+                    .eq(Serve::getServeItemId, serveUpsertReqDTO.getServeItemId());
+            Integer count = baseMapper.selectCount(queryWrapper);
+            if(count>0){
+                throw new ForbiddenOperationException(serveItem.getName()+"服务已存在");
             }
-            //组装数据
-            Serve serve = BeanUtils.toBean(serveUpsertReqDTO, Serve.class);
-            Long regionId = serve.getRegionId();
-            String cityCode = regionMapper.selectById(regionId).getCityCode();
-            serve.setCityCode(cityCode);
-            //插入
+
+            //3.新增服务
+            Serve serve = BeanUtil.toBean(serveUpsertReqDTO, Serve.class);
+            Region region = regionMapper.selectById(serveUpsertReqDTO.getRegionId());
+            serve.setCityCode(region.getCityCode());
             baseMapper.insert(serve);
         }
     }
@@ -76,47 +92,131 @@ public class ServeServiceImpl extends ServiceImpl<ServeMapper, Serve> implements
     @Transactional
     public Serve update(Long id, BigDecimal price) {
         //1.更新服务价格
-        boolean update = lambdaUpdate()
+        LambdaUpdateWrapper<Serve> updateWrapper = Wrappers.<Serve>lambdaUpdate()
                 .eq(Serve::getId, id)
-                .set(Serve::getPrice, price)
-                .update();
-        if(!update){
-            throw new CommonException("修改服务价格失败");
-        }
+                .set(Serve::getPrice, price);
+        super.update(updateWrapper);
+
         return baseMapper.selectById(id);
     }
 
     @Override
-    public Serve onSale(Long id) {
-        //根据id查询该服务
+    @Transactional
+    public void deleteById(Long id) {
         Serve serve = baseMapper.selectById(id);
-        if(ObjectUtils.isNull(serve)){
+        if(ObjectUtil.isNull(serve)){
             throw new ForbiddenOperationException("区域服务不存在");
         }
+        //草稿状态方可删除
+        if (!(serve.getSaleStatus()==FoundationStatusEnum.INIT.getStatus())) {
+            throw new ForbiddenOperationException("草稿状态方可删除");
+        }
 
-        //合法性校验，如果服务状态为草稿或下架则可以上架
+        //删除服务
+        baseMapper.deleteById(id);
+    }
+
+    @Override
+    @Transactional
+    public Serve onSale(Long id){
+        Serve serve = baseMapper.selectById(id);
+        if(ObjectUtil.isNull(serve)){
+            throw new ForbiddenOperationException("区域服务不存在");
+        }
+        //上架状态
         Integer saleStatus = serve.getSaleStatus();
-        if(!(saleStatus == FoundationStatusEnum.INIT.getStatus() || saleStatus == FoundationStatusEnum.DISABLE.getStatus())){
+        //草稿或下架状态方可上架
+        if (!(saleStatus==FoundationStatusEnum.INIT.getStatus() || saleStatus==FoundationStatusEnum.DISABLE.getStatus())) {
             throw new ForbiddenOperationException("草稿或下架状态方可上架");
         }
-        //服务项状态为启用才可以上架
+        //服务项id
         Long serveItemId = serve.getServeItemId();
         ServeItem serveItem = serveItemMapper.selectById(serveItemId);
-        if(ObjectUtils.isNull(serveItem)){
-            throw new ForbiddenOperationException("服务项不存在");
+        if(ObjectUtil.isNull(serveItem)){
+            throw new ForbiddenOperationException("所属服务项不存在");
+        }
+        //服务项的启用状态
+        Integer activeStatus = serveItem.getActiveStatus();
+        //服务项为启用状态方可上架
+        if (!(FoundationStatusEnum.ENABLE.getStatus()==activeStatus)) {
+            throw new ForbiddenOperationException("服务项为启用状态方可上架");
         }
 
-        if(serveItem.getActiveStatus() != FoundationStatusEnum.ENABLE.getStatus()){
-            throw new ForbiddenOperationException("服务项为启用才可以上架");
+        //更新上架状态
+        LambdaUpdateWrapper<Serve> updateWrapper = Wrappers.<Serve>lambdaUpdate()
+                .eq(Serve::getId, id)
+                .set(Serve::getSaleStatus, FoundationStatusEnum.ENABLE.getStatus());
+        update(updateWrapper);
+        return baseMapper.selectById(id);
 
+    }
+
+    @Override
+    @Transactional
+    public Serve offSale(Long id){
+        Serve serve = baseMapper.selectById(id);
+        if(ObjectUtil.isNull(serve)){
+            throw new ForbiddenOperationException("区域服务不存在");
         }
-        //上架
-        boolean update = lambdaUpdate().eq(Serve::getId, id)
-                .set(Serve::getSaleStatus, FoundationStatusEnum.ENABLE.getStatus())
-                .update();
-        if(!update){
-            throw new CommonException("上架失败");
+        //上架状态
+        Integer saleStatus = serve.getSaleStatus();
+        //上架状态方可下架
+        if (!(saleStatus==FoundationStatusEnum.ENABLE.getStatus())) {
+            throw new ForbiddenOperationException("上架状态方可下架");
         }
+        //更新下架状态
+        LambdaUpdateWrapper<Serve> updateWrapper = Wrappers.<Serve>lambdaUpdate()
+                .eq(Serve::getId, id)
+                .set(Serve::getSaleStatus, FoundationStatusEnum.DISABLE.getStatus());
+        update(updateWrapper);
         return baseMapper.selectById(id);
     }
+
+
+    /**
+     * 服务设置热门/取消
+     *
+     * @param id   服务id
+     * @param flag 是否为热门，0：非热门，1：热门
+     */
+    @Override
+    @Transactional
+    public void changeHotStatus(Long id, Integer flag) {
+        //1.设置热门
+        LambdaUpdateWrapper<Serve> updateWrapper = Wrappers.<Serve>lambdaUpdate()
+                .eq(Serve::getId, id)
+                .set(Serve::getIsHot, flag)
+                .set(Serve::getHotTimeStamp, System.currentTimeMillis());
+        super.update(updateWrapper);
+    }
+
+    /**
+     * 根据区域id和售卖状态查询关联服务数量
+     *
+     * @param regionId   区域id
+     * @param saleStatus 售卖状态，0：草稿，1下架，2上架。可传null，即查询所有状态
+     * @return 服务数量
+     */
+    @Override
+    public int queryServeCountByRegionIdAndSaleStatus(Long regionId, Integer saleStatus) {
+        LambdaQueryWrapper<Serve> queryWrapper = Wrappers.<Serve>lambdaQuery()
+                .eq(Serve::getRegionId, regionId)
+                .eq(ObjectUtil.isNotEmpty(saleStatus), Serve::getSaleStatus, saleStatus);
+        return baseMapper.selectCount(queryWrapper);
+    }
+    /**
+     * 根据服务项id和售卖状态查询关联服务数量
+     *
+     * @param  serveItemId  服务项id
+     * @param saleStatus 售卖状态，0：草稿，1下架，2上架。可传null，即查询所有状态
+     * @return 服务数量
+     */
+    @Override
+    public int queryServeCountByServeItemIdAndSaleStatus(Long serveItemId, Integer saleStatus) {
+        LambdaQueryWrapper<Serve> queryWrapper = Wrappers.<Serve>lambdaQuery()
+                .eq(Serve::getServeItemId, serveItemId)
+                .eq(ObjectUtil.isNotEmpty(saleStatus), Serve::getSaleStatus, saleStatus);
+        return baseMapper.selectCount(queryWrapper);
+    }
+
 }
